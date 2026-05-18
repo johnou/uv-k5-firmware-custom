@@ -78,6 +78,32 @@ uint8_t keyTickCounter = 0;
 
 // -----------------------------------------------------
 
+static void MSG_ReadRxFifoWords(const uint16_t words)
+{
+	for (uint16_t i = 0; i < words; i++) {
+		const uint16_t word = BK4819_ReadRegister(BK4819_REG_5F);
+
+		if (gFSKWriteIndex < sizeof(dataPacket.serializedArray))
+			dataPacket.serializedArray[gFSKWriteIndex++] = (word >> 0) & 0xff;
+		if (gFSKWriteIndex < sizeof(dataPacket.serializedArray))
+			dataPacket.serializedArray[gFSKWriteIndex++] = (word >> 8) & 0xff;
+	}
+}
+
+static bool MSG_PayloadIsValid(void)
+{
+	for (uint8_t i = 0; i < PAYLOAD_LENGTH; i++) {
+		const uint8_t c = dataPacket.data.payload[i];
+
+		if (c == '\0')
+			return true;
+		if (c != 0x1b && (c < 32 || c > 127))
+			return false;
+	}
+
+	return false;
+}
+
 void MSG_FSKSendData() {
 
 	// turn off CTCSS/CDCSS during FFSK
@@ -240,7 +266,6 @@ void MSG_SendPacket() {
 				);
 			}
 		#endif
-
 		BK4819_DisableDTMF();
 
 		// mute the mic during TX
@@ -306,27 +331,26 @@ void MSG_StorePacket(const uint16_t interrupt_bits) {
 
 	if (rx_fifo_almost_full && msgStatus == RECEIVING) {
 
-		const uint16_t count = BK4819_ReadRegister(BK4819_REG_5E) & (7u << 0);  // almost full threshold
-		for (uint16_t i = 0; i < count; i++) {
-			const uint16_t word = BK4819_ReadRegister(BK4819_REG_5F);
-			if (gFSKWriteIndex < sizeof(dataPacket.serializedArray))
-				dataPacket.serializedArray[gFSKWriteIndex++] = (word >> 0) & 0xff;
-			if (gFSKWriteIndex < sizeof(dataPacket.serializedArray))
-				dataPacket.serializedArray[gFSKWriteIndex++] = (word >> 8) & 0xff;
-		}
+		const uint16_t count = BK4819_ReadRegister(BK4819_REG_5E) & 7u;  // almost full threshold
+		MSG_ReadRxFifoWords(count);
 
 		SYSTEM_DelayMs(10);
 
 	}
 
 	if (rx_finished) {
+		if (msgStatus == RECEIVING && gFSKWriteIndex < sizeof(dataPacket.serializedArray)) {
+			const uint16_t remaining = sizeof(dataPacket.serializedArray) - gFSKWriteIndex;
+			MSG_ReadRxFifoWords((remaining + 1) / 2);
+		}
+
 		// turn off green LED
 		BK4819_ToggleGpioOut(BK4819_GPIO6_PIN2_GREEN, 0);
 		BK4819_FskClearFifo();
 		BK4819_FskEnableRx();
 		msgStatus = READY;
 
-		if (gFSKWriteIndex > 2) {
+		if (gFSKWriteIndex == sizeof(dataPacket.serializedArray)) {
 			MSG_HandleReceive();
 		}
 		gFSKWriteIndex = 0;
@@ -358,6 +382,8 @@ void MSG_SendAck() {
 }
 
 void MSG_HandleReceive(){
+	bool validPayload = true;
+
 	if (dataPacket.data.header == ACK_PACKET) {
 	#ifdef ENABLE_MESSENGER_DELIVERY_NOTIFICATION
 		#ifdef ENABLE_MESSENGER_UART
@@ -384,12 +410,18 @@ void MSG_HandleReceive(){
 						gEncryptionKey,
 						256);
 				}
-				snprintf(rxMessage[3], PAYLOAD_LENGTH + 2, "< %s", dataPacket.data.payload);
-			#else
-				snprintf(rxMessage[3], PAYLOAD_LENGTH + 2, "< %s", dataPacket.data.payload);
 			#endif
+			validPayload = MSG_PayloadIsValid();
+			dataPacket.data.payload[PAYLOAD_LENGTH - 1] = '\0';
+			if (validPayload) {
+				snprintf(rxMessage[3], PAYLOAD_LENGTH + 2, "< %s", dataPacket.data.payload);
+			}
+			else {
+				snprintf(rxMessage[3], PAYLOAD_LENGTH + 2, "ERROR: CORRUPT PACKET.");
+			}
 			#ifdef ENABLE_MESSENGER_UART
-				UART_printf("SMS<%s\r\n", dataPacket.data.payload);
+				if (validPayload)
+					UART_printf("SMS<%s\r\n", dataPacket.data.payload);
 			#endif
 		}
 
@@ -407,8 +439,10 @@ void MSG_HandleReceive(){
 	}
 
 	// Transmit a message to the sender that we have received the message
-	if (dataPacket.data.header == MESSAGE_PACKET ||
+	if (validPayload &&
+		(dataPacket.data.header == MESSAGE_PACKET ||
 		dataPacket.data.header == ENCRYPTED_MESSAGE_PACKET)
+	)
 	{
 		// wait so the correspondent radio can properly receive it
 		SYSTEM_DelayMs(700);
